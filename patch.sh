@@ -1,10 +1,11 @@
 #!/bin/bash
-# 把官网 WechatOpenSDK.xcframework 拷进本仓库,并补齐 SPM / App Store 需要的
-# framework Info.plist。
-#
-# 不改 Mach-O。微信 2.0.8 的 inner binary 是静态 .a,每个 .o 带
-# LC_VERSION_MIN_IPHONEOS 5.1.1;vtool 因 load command 空间不够无法改写。
-# 静态库会链进宿主 App,最终最低系统版本跟 App deployment target。
+# 把官网 WechatOpenSDK.xcframework 拷进本仓库,并做 App Store 需要的修正:
+#   1. 每个 .o 的 LC_VERSION_MIN_IPHONEOS / LC_BUILD_VERSION minos 改成宿主
+#      最低 iOS(默认 17.0)。微信静态 .a 的 load command 没有多余空间,vtool
+#      会报 not enough space;因此只原地改 version/minos 这 4 个字节,不重链。
+#   2. inner WechatOpenSDK.framework 补齐合法 Info.plist(FMWK + 官方版本号)。
+#      官方 plist 缺 CFBundlePackageType、版本写成 1.0;SPM 嵌入时商店会验。
+#   3. 删除失效签名(若有);framework 会在宿主 App 归档时随 App 重新签名。
 #
 # 用法:
 #   ./patch.sh <源 WechatOpenSDK.xcframework 路径> [最低iOS版本(默认17.0)]
@@ -58,6 +59,87 @@ if [[ -z "$PAY_HEADER" ]] || ! grep -q '@interface PayReq' "$PAY_HEADER"; then
     exit 1
 fi
 
+# 原地改 Mach-O 里的 minos / LC_VERSION_MIN version,不重链。
+patch_object() {
+    local object="$1"
+    python3 - "$object" "$MIN_IOS" <<'PY'
+import struct, sys
+
+path, minos_s = sys.argv[1], sys.argv[2]
+parts = [int(x) for x in minos_s.split(".")] + [0, 0]
+minos = (parts[0] << 16) | (parts[1] << 8) | parts[2]
+
+LC_VERSION_MIN_IPHONEOS = 0x25
+LC_BUILD_VERSION = 0x32
+MH_MAGIC_64 = 0xFEEDFACF
+MH_MAGIC = 0xFEEDFACE
+
+data = bytearray(open(path, "rb").read())
+magic = struct.unpack_from("<I", data, 0)[0]
+if magic == MH_MAGIC_64:
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    off = 32
+elif magic == MH_MAGIC:
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    off = 28
+else:
+    raise SystemExit(f"{path}: not mach-o ({magic:#x})")
+
+changed = 0
+for _ in range(ncmds):
+    cmd, cmdsize = struct.unpack_from("<II", data, off)
+    if cmd == LC_VERSION_MIN_IPHONEOS and cmdsize >= 16:
+        struct.pack_into("<I", data, off + 8, minos)
+        changed += 1
+    elif cmd == LC_BUILD_VERSION and cmdsize >= 24:
+        struct.pack_into("<I", data, off + 12, minos)
+        changed += 1
+    off += cmdsize
+
+if changed == 0:
+    raise SystemExit(f"{path}: 没有 LC_VERSION_MIN_IPHONEOS / LC_BUILD_VERSION")
+open(path, "wb").write(data)
+PY
+}
+
+# 静态 .a(可能是 fat):拆 arch → 抽 .o → 改 minos → 重新归档 → 再合并。
+patch_archive() {
+    local binary="$1"
+    local archs
+    archs="$(lipo -archs "$binary")"
+    local tmp
+    tmp="$(mktemp -d)"
+    local thin_files=()
+
+    for arch in $archs; do
+        local thin="$tmp/$arch.a"
+        local objs="$tmp/$arch.objs"
+        mkdir -p "$objs"
+        lipo "$binary" -thin "$arch" -output "$thin"
+        (cd "$objs" && ar -x "$thin")
+        local obj_list=()
+        for obj in "$objs"/*.o; do
+            [[ -f "$obj" ]] || continue
+            patch_object "$obj"
+            obj_list+=("$obj")
+        done
+        if [[ ${#obj_list[@]} -eq 0 ]]; then
+            echo "❌ $binary ($arch) 里没有 .o" >&2
+            rm -rf "$tmp"
+            exit 1
+        fi
+        libtool -static -o "$tmp/$arch.patched.a" "${obj_list[@]}"
+        thin_files+=("$tmp/$arch.patched.a")
+    done
+
+    if [[ ${#thin_files[@]} -gt 1 ]]; then
+        lipo -create "${thin_files[@]}" -output "$binary"
+    else
+        cp "${thin_files[0]}" "$binary"
+    fi
+    rm -rf "$tmp"
+}
+
 write_framework_plist() {
     local fw_dir="$1"
     cat > "$fw_dir/Info.plist" <<PLIST
@@ -96,7 +178,8 @@ for slice_dir in "$DEST_XCFRAMEWORK"/*/; do
     [[ -d "$fw_dir" && -f "$binary" ]] || continue
     slice_count=$((slice_count + 1))
 
-    echo "修正 $slice_name ..."
+    echo "改写 $slice_name ..."
+    patch_archive "$binary"
     write_framework_plist "$fw_dir"
     rm -rf "$fw_dir/_CodeSignature"
 done
@@ -114,7 +197,8 @@ has_simulator=0
 for slice_dir in "$DEST_XCFRAMEWORK"/*/; do
     slice_name="$(basename "$slice_dir")"
     fw_dir="$slice_dir/WechatOpenSDK.framework"
-    [[ -d "$fw_dir" ]] || continue
+    binary="$fw_dir/WechatOpenSDK"
+    [[ -f "$binary" ]] || continue
 
     if [[ "$slice_name" == *simulator* ]]; then
         has_simulator=1
@@ -122,18 +206,21 @@ for slice_dir in "$DEST_XCFRAMEWORK"/*/; do
         has_device=1
     fi
 
-    if [[ ! -f "$fw_dir/Info.plist" ]]; then
-        echo "❌ $slice_name 缺少 Info.plist"; fail=1; continue
-    fi
-    pkg="$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$fw_dir/Info.plist" 2>/dev/null || true)"
-    ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$fw_dir/Info.plist" 2>/dev/null || true)"
-    if [[ "$pkg" != "FMWK" ]]; then
-        echo "❌ $slice_name CFBundlePackageType=$pkg (期望 FMWK)"; fail=1
-    elif [[ "$ver" != "$SHORT_VERSION" ]]; then
-        echo "❌ $slice_name CFBundleShortVersionString=$ver (期望 $SHORT_VERSION)"; fail=1
+    if otool -l "$binary" | grep -E -q 'version 5\.|minos 5\.|minos 14\.'; then
+        echo "❌ $slice_name 仍残留过低的 minos / LC_VERSION_MIN"; fail=1
+    elif [[ ! -f "$fw_dir/Info.plist" ]]; then
+        echo "❌ $slice_name 缺少 Info.plist"; fail=1
     else
-        archs="$(lipo -archs "$fw_dir/WechatOpenSDK" 2>/dev/null || echo "?")"
-        echo "✅ $slice_name -> FMWK $ver, archs: $archs"
+        pkg="$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$fw_dir/Info.plist" 2>/dev/null || true)"
+        ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$fw_dir/Info.plist" 2>/dev/null || true)"
+        if [[ "$pkg" != "FMWK" ]]; then
+            echo "❌ $slice_name CFBundlePackageType=$pkg (期望 FMWK)"; fail=1
+        elif [[ "$ver" != "$SHORT_VERSION" ]]; then
+            echo "❌ $slice_name CFBundleShortVersionString=$ver (期望 $SHORT_VERSION)"; fail=1
+        else
+            archs="$(lipo -archs "$binary")"
+            echo "✅ $slice_name -> minos $MIN_IOS, FMWK $ver, archs: $archs"
+        fi
     fi
 done
 
