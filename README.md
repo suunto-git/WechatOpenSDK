@@ -5,7 +5,7 @@
 - **Current WechatOpenSDK version:** 2.0.8
 - **变体(variant):** 含支付（不是 `NoPay`）
 - **官方下载:** https://developers.weixin.qq.com/doc/oplatform/Downloads/iOS_Resource.html
-- **最低 iOS:** 17.0（与 STTiOS / AlipaySDK 包装一致）
+- **最低 iOS:** 17.0（与 STTiOS 一致）
 
 > **为什么用含支付包而不是 NoPay:** 中国区 App 要通过 `PayReq` 调起微信支付。NoPay 变体没有支付接口。升级时务必继续从官网 **含支付** 目录取源。
 
